@@ -43,9 +43,3 @@ example.Target.compute(I)I | 1B 06 68 10 07 60 AC
 
 The class name, method name, and JVM descriptor uniquely identify overloaded
 methods. Abstract and native methods have no bytecode and are skipped.
-
-## Releases
-
-Every push and pull request builds the release configuration on Linux and
-Windows. Pushing a tag such as `v0.1.0` also publishes both packaged binaries
-as a GitHub release.
