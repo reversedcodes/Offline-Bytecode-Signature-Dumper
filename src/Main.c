@@ -1,15 +1,23 @@
 #include <jni2hook/utils/class_file.h>
 #include <miniz.h>
 
+#include <errno.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+#include <direct.h>
+#else
+#include <sys/stat.h>
+#endif
+
 typedef struct
 {
     size_t classes;
     size_t signatures;
+    size_t extracted;
     size_t failures;
 } dump_stats;
 
@@ -47,6 +55,132 @@ static bool has_suffix(const char *text, const char *suffix)
     const size_t text_length = strlen(text);
     const size_t suffix_length = strlen(suffix);
     return text_length >= suffix_length && strcmp(text + text_length - suffix_length, suffix) == 0;
+}
+
+static bool make_directory(const char *path)
+{
+#if defined(_WIN32)
+    const int result = _mkdir(path);
+#else
+    const int result = mkdir(path, 0755);
+#endif
+    return result == 0 || errno == EEXIST;
+}
+
+static bool create_directories(const char *path)
+{
+    const size_t length = strlen(path);
+    char *copy = malloc(length + 1);
+    if (copy == NULL)
+        return false;
+    memcpy(copy, path, length + 1);
+
+    for (size_t i = 0; i < length; i++)
+        if (copy[i] == '\\')
+            copy[i] = '/';
+
+    bool ok = true;
+    for (size_t i = 1; i < length; i++)
+    {
+        if (copy[i] != '/')
+            continue;
+        if (i == 2 && copy[1] == ':')
+            continue;
+
+        copy[i] = '\0';
+        if (copy[0] != '\0' && !make_directory(copy))
+        {
+            ok = false;
+            break;
+        }
+        copy[i] = '/';
+    }
+
+    if (ok && length != 0)
+        ok = make_directory(copy);
+    free(copy);
+    return ok;
+}
+
+static bool archive_path_is_safe(const char *path)
+{
+    if (path[0] == '\0' || path[0] == '/' || path[0] == '\\')
+        return false;
+
+    const char *component = path;
+    for (const char *cursor = path;; cursor++)
+    {
+        if (*cursor == ':')
+            return false;
+        if (*cursor != '/' && *cursor != '\\' && *cursor != '\0')
+            continue;
+
+        const size_t length = (size_t)(cursor - component);
+        if (length == 2 && component[0] == '.' && component[1] == '.')
+            return false;
+        if (*cursor == '\0')
+            return true;
+        component = cursor + 1;
+    }
+}
+
+static char *extracted_path(const char *directory, const char *entry)
+{
+    const size_t directory_length = strlen(directory);
+    const size_t entry_length = strlen(entry);
+    const bool separator = directory_length != 0 && directory[directory_length - 1] != '/' &&
+                           directory[directory_length - 1] != '\\';
+    char *path = malloc(directory_length + (separator ? 1u : 0u) + entry_length + 1u);
+    if (path == NULL)
+        return NULL;
+
+    memcpy(path, directory, directory_length);
+    size_t offset = directory_length;
+    if (separator)
+        path[offset++] = '/';
+    for (size_t i = 0; i < entry_length; i++)
+        path[offset++] = entry[i] == '\\' ? '/' : entry[i];
+    path[offset] = '\0';
+    return path;
+}
+
+static bool create_parent_directories(char *path)
+{
+    char *separator = strrchr(path, '/');
+    if (separator == NULL)
+        return true;
+
+    *separator = '\0';
+    const bool ok = create_directories(path);
+    *separator = '/';
+    return ok;
+}
+
+static bool extract_entry(mz_zip_archive *archive, mz_uint index,
+                          const mz_zip_archive_file_stat *file,
+                          const char *directory, bool is_directory)
+{
+    if (!archive_path_is_safe(file->m_filename))
+    {
+        fprintf(stderr, "refusing unsafe archive path: %s\n", file->m_filename);
+        return false;
+    }
+
+    char *path = extracted_path(directory, file->m_filename);
+    if (path == NULL)
+        return false;
+
+    bool ok;
+    if (is_directory)
+        ok = create_directories(path);
+    else
+        ok = create_parent_directories(path) &&
+             mz_zip_reader_extract_to_file(archive, index, path, 0);
+
+    if (!ok)
+        fprintf(stderr, "cannot extract %s\n", file->m_filename);
+    free(path);
+    return ok;
 }
 
 static bool get_class_name(const ClassFile *class_file, const u1 **out_name, u2 *out_length)
@@ -250,7 +384,8 @@ static bool dump_class_file(FILE *output, const char *target, dump_stats *stats)
     return ok;
 }
 
-static bool dump_archive(FILE *output, const char *target, dump_stats *stats)
+static bool dump_archive(FILE *output, const char *target,
+                         const char *extract_directory, dump_stats *stats)
 {
     mz_zip_archive archive;
     memset(&archive, 0, sizeof(archive));
@@ -261,7 +396,10 @@ static bool dump_archive(FILE *output, const char *target, dump_stats *stats)
         return false;
     }
 
-    bool ok = true;
+    bool ok = extract_directory == NULL || create_directories(extract_directory);
+    if (!ok)
+        fprintf(stderr, "cannot create extraction directory %s\n", extract_directory);
+
     const mz_uint file_count = mz_zip_reader_get_num_files(&archive);
     for (mz_uint i = 0; i < file_count; i++)
     {
@@ -274,8 +412,22 @@ static bool dump_archive(FILE *output, const char *target, dump_stats *stats)
             continue;
         }
 
-        if (mz_zip_reader_is_file_a_directory(&archive, i) ||
-            !has_suffix(file.m_filename, ".class"))
+        const bool is_directory = mz_zip_reader_is_file_a_directory(&archive, i);
+        if (extract_directory != NULL)
+        {
+            if (extract_entry(&archive, i, &file, extract_directory, is_directory))
+            {
+                if (!is_directory)
+                    stats->extracted++;
+            }
+            else
+            {
+                stats->failures++;
+                ok = false;
+            }
+        }
+
+        if (is_directory || !has_suffix(file.m_filename, ".class"))
             continue;
 
         size_t size = 0;
@@ -318,9 +470,15 @@ static int target_kind(const char *target)
 
 int main(int argc, char **argv)
 {
-    if (argc != 3)
+    const bool extract_requested = argc == 5 &&
+                                   (strcmp(argv[3], "--extract") == 0 ||
+                                    strcmp(argv[3], "-x") == 0);
+    if (argc != 3 && !extract_requested)
     {
-        fprintf(stderr, "usage: %s <target.class|target.jar> <output.txt>\n", argv[0]);
+        fprintf(stderr,
+                "usage: %s <target.class|target.jar> <output.txt> "
+                "[--extract <directory>]\n",
+                argv[0]);
         return 2;
     }
 
@@ -336,6 +494,11 @@ int main(int argc, char **argv)
         fprintf(stderr, "%s is not a class file or ZIP/JAR archive\n", argv[1]);
         return 1;
     }
+    if (extract_requested && kind != 2)
+    {
+        fprintf(stderr, "--extract requires a ZIP/JAR archive\n");
+        return 2;
+    }
 
     FILE *output = fopen(argv[2], "w");
     if (output == NULL)
@@ -346,7 +509,9 @@ int main(int argc, char **argv)
 
     dump_stats stats = {0};
     const bool dumped = kind == 1 ? dump_class_file(output, argv[1], &stats)
-                                  : dump_archive(output, argv[1], &stats);
+                                  : dump_archive(output, argv[1],
+                                                 extract_requested ? argv[4] : NULL,
+                                                 &stats);
     const bool closed = fclose(output) == 0;
 
     if (!dumped || !closed || stats.failures != 0 || stats.signatures == 0)
@@ -357,5 +522,7 @@ int main(int argc, char **argv)
     }
 
     printf("wrote %zu signatures from %zu classes to %s\n", stats.signatures, stats.classes, argv[2]);
+    if (extract_requested)
+        printf("extracted %zu files to %s\n", stats.extracted, argv[4]);
     return 0;
 }
